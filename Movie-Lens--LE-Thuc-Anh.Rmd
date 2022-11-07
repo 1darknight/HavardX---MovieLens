@@ -1,0 +1,444 @@
+---
+title: "Project Movie Lens Report"
+author: "Le Thuc Anh"
+date: "May 20, 2022"
+output: 
+  pdf_document:
+    number_sections: yes
+    toc: yes  
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 10, fig.height = 5, tidy.opts=list(width.cutoff=120), tidy=TRUE)
+options(max.print = 1000, width = 1000)
+```
+
+# Packages installation
+
+Requring packages and setting options in R
+
+```{r packages&options}
+# Require packages
+Packages <- c("data.table", "tidyverse", "ggplot2", "caret", "Matrix", "hrbrthemes", "viridis", "recosystem")
+# Print non-scientific number with maximum 4 signifcant digits 
+options("scipen" = 999, "digits" = 4)
+```
+
+```{r, apply packages, include = FALSE}
+lapply(Packages, require, character.only = TRUE)
+```
+
+# Introduction
+
+The *Movie Lens* dataset are being generated with the inspiration from the infamous *Netflix challenge* which prized the team who could improve their recommendation system by 10%.
+This project is trying to apply the process of the Netflix challenge winner on the *Movie Lens* dataset.
+
+# Data Preparation
+
+The following chunk of code is to create edx set (training) and validation set (test set) from the *Movie Lens* dataset.
+
+```{r edx and validation set, warning = FALSE }
+#
+# Create edx set, validation set (final hold-out test set)
+#
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId), 
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+    semi_join(edx, by = "movieId") %>%
+    semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+```
+
+Prior to build any models, we need to have a measure of success to evaluate models prediction.
+**RMSE** is a good measure in this case for recommendation models.\
+
+So that, the RMSE function is generated from the RMSE formula to calculate the **RMSE** from models built as the code:
+
+```{r RMSE}
+RMSE <- function(true_ratings, predicted_ratings){
+    sqrt(mean((true_ratings - predicted_ratings)^2))
+  }
+```
+
+# Data Exploration & Visualization
+
+Firstly, let's exploring the *Movie Lens* dataset provided!
+
+## Overview
+
+The *Movie Lens* dataset:
+
+```{r, edx print, results = 'asis'}
+print(edx)
+```
+
+The shape of the dataset:
+
+```{r, edx dim}
+dim(edx)
+```
+
+*Movie Lens* dataset has 9000055 rows and 6 columns.
+
+```{r, edx NA}
+sum(is.na(edx))
+```
+
+There are no NAs values in *Movie Lens* dataset so I could say that the dataset has:\
+\* 9000055 ratings for movies\
+\* 6 columns of related information
+
+In the *Movie Lens* dataset, the distinct number of users and movies are:
+
+```{r, user and movie summary}
+edx %>% summarize(user_n = n_distinct(userId),
+                  movie_n = n_distinct(movieId))
+```
+
+And, we could see how sparse the *Movie Lens* matrix really is using this code:
+
+Each row represent one user and each column represent one movie.\
+
+Each dot is the missing rating that one of the user did not rate one particular movie.
+
+```{r, sparsematrix, results= 'asis'}
+edxmatrix = sparseMatrix(i = as.integer(as.factor(edx$userId)),
+                            j = as.integer(as.factor(edx$movieId)),
+                            x = edx$rating)
+print(edxmatrix)
+```
+
+## Visualizations
+
+Number of ratings per movie is visualized using below barplot that has been scaled by log
+
+```{r, distribution of movies, echo = FALSE}
+edx  %>% group_by(movieId) %>% summarize(n = n()) %>% 
+    #group_by(n_rating) %>% summarize(n_movie = n()) %>%
+    ggplot(aes(x = n)) + geom_histogram(bins = 30, fill = "#69b3a2", color = "#e9ecef") + 
+  scale_x_log10() + ggtitle("Distribution of Movies") +
+    xlab("Number of Ratings") +
+    ylab("Number of Movies") 
+```
+
+By observing this barplot, we learned that movies are being rated differently in terms of number of ratings.
+Some movies are being rated a lot more than others.
+
+Number of ratings per user is visualized using below barplot that has been scaled by log
+
+```{r, distribution of user, echo = FALSE}
+edx  %>% group_by(userId) %>% summarize(n = n()) %>% 
+    #group_by(n_rating) %>% summarize(n_movie = n()) %>%
+    ggplot(aes(x = n)) + geom_histogram(bins = 30, fill = "#69b3a2", color = "#e9ecef") + 
+  scale_x_log10() + ggtitle("Distribution of Users") +
+    xlab("Number of Ratings") +
+    ylab("Number of Users") 
+```
+
+The same insight also applied for users, users has different number of times they rated and some users are more active than others.
+
+# Method and Analysis
+
+Based on the Netflix Challenge winner, they used several methods to estimate effects to predict the ratings.
+
+-   The movie and user effects
+
+-   Regularization
+
+-   Matrix Factorization
+
+These method will be explained in details below.
+
+# The Movie and User Effects
+
+First, let's build the simplest predictive model, the naive model that predicts the same rating for each missing point in the dataset.
+
+## Naive model
+
+```{r, rating mean}
+mu = mean(edx$rating)
+mu
+```
+
+The mean of all the rating inside *Movie Lens* dataset are around 3 and a half star.\
+
+So that, the RMSE of the *Naive model* is calculated as follow:
+
+```{r, naive RMSE}
+naive_rmse  = RMSE(validation$rating, mu)
+naive_rmse
+```
+
+Testing the *Naive model* on the test set gave the **RMSE** of around 1.6
+
+## The movie effects
+
+As learned from the above barplot about the different movie, each movie has different number of ratings.
+
+So that, to add the movie effects to the model, we need to add a buffer to the rating predictions.
+This buffer will determine the final ratings of each movie compare to the mean of all ratings.
+
+To calculate effects of each Movie, we will calculate the amount of stars the rated rating differ from the overall mean of all movie rating.
+
+And the buffer for each movie is the mean of the amount different for each movie.
+
+```{r, buffer_mv}
+mu = mean(edx$rating)
+buffer_mv = edx[ , mean(rating - mu), by = movieId][,.(movieId, bf_mv = V1)]
+```
+
+So that, rating of movie *i* will be:
+
+Rating_i = mu + buffer_mv_i + error
+
+As this equation is not absolutely right in all circumstances, we will add an error number represent the error amount different from the real ratings.
+Otherwise, let's determine rating mainly by mu and buffer of each movie.
+
+```{r, movie RMSE buffer, warning = FALSE }
+pred_movie_effects = validation[buffer_mv, on = 'movieId',pred_rating := mu + bf_mv ][, pred_rating ]
+```
+
+```{r}
+RMSE(validation$rating, pred_movie_effects)
+```
+
+After adding the special effects of each movie, we got a better *RMSE* score of 0.94.
+
+## The user effects
+
+Not only each movie has its own effect, each user also has unique effects to the rating, too.
+As users has different interest in movies and genres.
+
+Now we will add user buffer to the equation, so that rating of a movie i will be: Rating_i = mu + buffer_mv_i + buffer_us_i + error
+
+Similarly, we will calculate the amount of stars the rated rating differ from the overall mean of all user rating.
+
+And the buffer for each movie is the mean of the amount different for each user.
+
+```{r, buffer_us}
+mu = mean(edx$rating)
+buffer_us = edx[, mean(rating - mu), by = userId][,.(userId, bf_us = V1)]
+```
+
+```{r, user RMSE buffer}
+pred_us_mv_effects = validation[buffer_mv, on = 'movieId', bf_mv := i.bf_mv][buffer_us, on = 'userId',  bf_us := i.bf_us][, pred := mu + bf_mv + bf_us][, pred]
+RMSE(validation$rating, pred_us_mv_effects)
+```
+
+We got the *RMSE* score of 0.885 which is nearer to the target 0.885 of the *Netflix Challenge*
+
+# Regularization
+
+## Why we need regularization?
+
+Let's dive deep in the predicted ratings we got so far.
+To check the rightness of our predicted ratings, let's see the extreme mistakes we made.
+
+Here are the top 10 worst mistakes in our movie effect models:
+
+```{r, results= 'asis'}
+head(validation[, residual := (rating - (mu + bf_mv))][order(-abs(residual))][,title], 10)
+```
+
+The **"Shawshank Redemption, The (1994)"** has 3111, **"Usual Suspects, The (1995)"** has 2389 ratings and **"Godfather, The (1972)"** has 2067 raitngs.
+These movies have been rated quite a lot.
+
+First, we need to map movieId with movie titles:
+
+```{r}
+movie_titles = unique(edx[,c('movieId', 'title')])
+```
+
+Let's see the 10 best movies:
+
+```{r, results= 'asis'}
+ten_best = head(buffer_mv[movie_titles, on = 'movieId', title := title][order(-bf_mv)][,title], 10)
+ten_best
+```
+
+Let's see the 10 worst movies:
+
+```{r, results = 'asis'}
+ten_worst = head(buffer_mv[movie_titles, on = 'movieId', title := title][order(bf_mv)][,title], 10)
+ten_worst
+```
+
+Let's see how often they are rated:
+
+```{r, results = 'asis'}
+edx[movie_titles, on = 'movieId', title := title][buffer_mv, on = 'movieId', bf_mv := i.bf_mv][title %in% ten_best ,.N, by = c('movieId', 'bf_mv')][order(-bf_mv), N]
+
+edx[movie_titles, on = 'movieId', title := title][buffer_mv, on = 'movieId', bf_mv := i.bf_mv][title %in% ten_worst ,.N, by = c('movieId', 'bf_mv')][order(bf_mv), N]
+```
+
+These movie were rated by very few users.
+Most of the movie rated only have 1 rating.
+
+## Penalized least square
+
+The general idea of penalized regression is to control the total variability of the movie effects.
+Specifically, instead of minimizing the least squares equation, we minimize an equation that adds a penalty: This approach will have our desired effect: when our sample size is very large, a case which will give us a stable estimate, then the penalty.
+However, when the sample size is small, then the estimate is shrunken towards 0.
+The larger the *lambda* the more we shrink.
+
+## Choosing penalty term (lambda)
+
+```{r}
+lambdas <- seq(0, 10, 0.25)
+
+fn_lmbd_rmse <- sapply(lambdas, function(l){
+  mu <- mean(edx$rating)
+  mv <- edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  us <- edx %>% 
+    left_join(mv, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <- 
+    validation %>% 
+    left_join(mv, by = "movieId") %>%
+    left_join(us, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, validation$rating))
+})
+  data.table(l = lambdas, 
+           rmses = fn_lmbd_rmse) %>%
+  ggplot(aes(x = l, y = rmses)) +
+  geom_point() +
+  theme_minimal()
+```
+
+```{r}
+lambda = lambdas[which.min(fn_lmbd_rmse)]
+print(lambda)
+```
+
+The lambda has the smallest rmse is *5.25*.
+So that, we will use this lambda to find the final *RMSE* applying on both movie and user effects.
+
+```{r}
+mv <- edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+lambda))
+  us <- edx %>% 
+    left_join(mv, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+  predicted_ratings_reg <- 
+    validation %>% 
+    left_join(mv, by = "movieId") %>%
+    left_join(us, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+ RMSE(predicted_ratings_reg, validation$rating)
+```
+
+*RMSE* of *Regularization* is 0.8648.
+Better than only applying user and movie effects of 0.885.
+
+# Matrix Factorization
+
+One more step we could try is using *Matrix Factorization*.
+This method will consider a group of similar movie having similar rating patterns and groups of users having similar rating patterns as well.\
+
+Here we will use package recosystem with algorithms to predict the rating using factors analysis.
+
+First, we need to transform the train and test dataset to a real matrix of rating which contains both non-missing and missing values of rating.
+
+```{r}
+# transform train data
+train_edx <- with(edx, data_memory(user_index = userId,
+                                    item_index = movieId,                                        rating = rating))
+# transform test data
+test_vali <- with(validation, data_memory(user_index = userId,
+                                          item_index = movieId,
+                                          rating = rating)) 
+```
+
+And we will train with the train dataset:
+
+```{r}
+# create model object 
+r <-  recosystem::Reco()
+# training model 
+r$train(train_edx)
+```
+
+Then, we will test the trained model with validation dataset:
+
+```{r}
+# predict with model
+y_hat_edx <-  r$predict(test_vali, out_memory())
+```
+
+```{r}
+# RMSE
+RMSE(validation$rating, y_hat_edx)
+```
+
+And our Final RMSE is *0.832*
+
+# Results
+
+So that our *RMSE* has been improved through techniques used.
+Let's summary all *RMSE*:
+
+```{r, echo = FALSE}
+RMSE_result = data.table(method = c("Naive model", "Movie effect", "User effect", "Regularization", "Matrix Factorization"),
+           RMSE = c(RMSE(validation$rating, mu),
+             RMSE(validation$rating, pred_movie_effects),
+             RMSE(validation$rating, pred_us_mv_effects),
+             RMSE(predicted_ratings_reg, validation$rating),
+             RMSE(validation$rating, y_hat_edx)
+           ))
+RMSE_result[, pct_improved := (((lag(RMSE, 1) - RMSE) / lag(RMSE, 1) )*100)]
+print(RMSE_result)
+
+```
+
+The best *RMSE* that we achieved is *0.8322*.
+
+# Conclusion
+
+This project was using Movie Lens dataset to trying to predict the ratings of movies by users.
+There were total of 4 methods used: Movie Effects, User Effects, Regularization and Matrix Factorization.\
+
+After each method, the *RMSE* improved with the best improvement at around *11%*.
+The best *RMSE* achieved is *0.8322*.
